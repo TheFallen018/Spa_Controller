@@ -1,5 +1,5 @@
 //================================================================================
-// Spa Controller for ESP32
+// Spa Controller for ESP32 (Corrected Version)
 //
 // A WiFi-enabled spa controller that integrates with Home Assistant via MQTT.
 // It manages a pump, two heaters, and a blower based on temperature readings
@@ -10,7 +10,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <CircularBuffer.hpp>
+#include <CircularBuffer.hpp> // NOTE: This is no longer used for logic, but kept for potential future use.
 #include <WebServer.h>
 #include <ElegantOTA.h>
 #include "lut.h" // Assumes lut.h contains the ADC_LUT array
@@ -18,10 +18,10 @@
 //--- Pin Definitions ---
 const int PUMP_PIN = 13;
 const int EXTERNAL_HEATER_PIN = 26;
-const int INTERNAL_HEATER_PIN = 14;
-const int BLOWER_PIN = 12;
+const int INTERNAL_HEATER_PIN = 12;
+const int BLOWER_PIN = 14;
 const int LED_PIN = 27; // Unused in logic, but defined
-const int THERMISTOR_PIN = 34;
+const int THERMISTOR_PIN = 35;
 
 //--- Thermistor Configuration ---
 const int THERMISTORNOMINAL = 10000;      // Resistance at 25°C
@@ -31,7 +31,7 @@ const int SERIESRESISTOR = 10000;         // Value of the series resistor
 const int NUMSAMPLES = 10;                // Number of samples to average for a reading
 
 //--- WiFi & Web Server Configuration ---
-const char* WIFI_SSID = "2.4G-Tower";
+const char* WIFI_SSID = "2.4G-Tower_EXT";
 const char* WIFI_PASSWORD = "Network_Layer";
 const char* HOSTNAME = "spa-controller";
 WebServer server(80);
@@ -39,8 +39,8 @@ WebServer server(80);
 //--- MQTT Configuration ---
 const char* MQTT_BROKER = "192.168.0.180";
 const int MQTT_PORT = 1883;
-const char* MQTT_USER = "homeassistant";
-const char* MQTT_PASSWORD = "theeng1sualeNg8iexeethah4jongieJou8xu9aich8eimogh2aengo8ciet0tiL";
+const char* MQTT_USER = "mqtt_user";
+const char* MQTT_PASSWORD = "mqtt_user_password_#1";
 WiFiClient espClient;
 PubSubClient client(espClient);
 
@@ -52,6 +52,8 @@ const char* MQTT_STANDBY_WARMING_STATE_TOPIC = "spa/standby_warming/state";
 const char* MQTT_STANDBY_WARMING_SET_TOPIC = "spa/standby_warming/set";
 const char* MQTT_FAST_HEATING_STATE_TOPIC = "spa/fast_heating/state";
 const char* MQTT_FAST_HEATING_SET_TOPIC = "spa/fast_heating/set";
+const char* MQTT_CIRCULATION_ONLY_STATE_TOPIC = "spa/circulation_only/state";
+const char* MQTT_CIRCULATION_ONLY_SET_TOPIC = "spa/circulation_only/set";
 const char* MQTT_BLOWER_STATE_TOPIC = "spa/blower/state";
 const char* MQTT_BLOWER_SET_TOPIC = "spa/blower/set";
 const char* MQTT_TEMPERATURE_STATE_TOPIC = "spa/temperature/state";
@@ -63,18 +65,19 @@ bool spa_state = false;
 bool standby_warming_state = false;
 bool fast_heating_state = false;
 bool blower_state = false;
+bool circulation_only_state = false;
 float temperature_target = 43.0;
 float temperature_tolerance = 0.2;
 float standby_tolerance = 2.0;
 float standby_temp_delta = 2.0;
 float temperature = 0.0;
+float voltage_read = 0.0;
 
-// NEW: Exponential Moving Average alpha for temperature smoothing. Lower value = more smoothing.
+// Exponential Moving Average alpha for temperature smoothing. Lower value = more smoothing.
 const float EMA_ALPHA = 0.2; 
 
 //--- Global Objects & Buffers ---
 JsonDocument doc;
-CircularBuffer<float, 10> temp_history_buffer;
 char msg_buffer[256]; // General purpose buffer for MQTT messages etc.
 
 //--- Timing Control (Non-Blocking) ---
@@ -143,12 +146,15 @@ void setup() {
     html += "<tr><td>Spa Power</td><td><span class='state-" + String(spa_state ? "on" : "off") + "'>" + bool_to_on_off(spa_state) + "</span></td></tr>";
     html += "<tr><td>Standby Warming</td><td><span class='state-" + String(standby_warming_state ? "on" : "off") + "'>" + bool_to_on_off(standby_warming_state) + "</span></td></tr>";
     html += "<tr><td>Fast Heating</td><td><span class='state-" + String(fast_heating_state ? "on" : "off") + "'>" + bool_to_on_off(fast_heating_state) + "</span></td></tr>";
+    // FIX: Added circulation only state to the web page
+    html += "<tr><td>Circulation Only</td><td><span class='state-" + String(circulation_only_state ? "on" : "off") + "'>" + bool_to_on_off(circulation_only_state) + "</span></td></tr>";
     html += "<tr><td>Blower</td><td><span class='state-" + String(blower_state ? "on" : "off") + "'>" + bool_to_on_off(blower_state) + "</span></td></tr>";
     html += "</table>";
     html += "<h2>Temperature</h2><table>";
     html += "<tr><th>Parameter</th><th>Value</th></tr>";
-    html += "<tr><td>Current Temperature</td><td>" + String(temperature, 2) + " °C</td></tr>";
-    html += "<tr><td>Target Temperature</td><td>" + String(temperature_target, 2) + " °C</td></tr>";
+    html += "<tr><td>Current Temperature</td><td>" + String(temperature, 2) + "°C</td></tr>";
+    html += "<tr><td>Voltage Read</td><td>" + String(voltage_read, 2) + "</td></tr>";
+    html += "<tr><td>Target Temperature</td><td>" + String(temperature_target, 2) + "°C</td></tr>";
     html += "</table>";
     html += "<h2>GPIO Output States</h2><table>";
     html += "<tr><th>Device</th><th>GPIO Pin</th><th>State</th></tr>";
@@ -170,40 +176,35 @@ void setup() {
 void loop() {
   unsigned long current_time = millis();
 
-  // MODIFICATION: Non-blocking connection handler for WiFi and MQTT
   handle_connections();
   
-  // Only proceed if MQTT is connected
   if (client.connected()) {
-    client.loop(); // Process incoming MQTT messages
+    client.loop(); 
 
-    // --- Timed Actions ---
-
-    // Publish device availability and update states periodically
     if (current_time - last_mqtt_publish_time > MQTT_PUBLISH_INTERVAL) {
       last_mqtt_publish_time = current_time;
-      client.publish(MQTT_SPA_AVAILABLE, "online");
-      update_states(); // Refresh states to ensure everything is correct
+      client.publish(MQTT_SPA_AVAILABLE, "online", true); // Publish with retain flag
+      update_states(); 
     }
 
-    // Read temperature periodically
     if (current_time - last_temp_read_time > TEMP_READ_INTERVAL) {
       last_temp_read_time = current_time;
       float new_temp = get_temp();
 
-      // ERROR HANDLING: Check for valid sensor reading
       if (!isnan(new_temp)) {
-        // Apply smoothing if we have a previous valid temperature
-        if (temperature == 0.0) {
+        // Apply EMA smoothing
+        if (temperature == 0.0) { // Initial reading
             temperature = new_temp;
         } else {
             temperature = (temperature * (1.0 - EMA_ALPHA)) + (new_temp * EMA_ALPHA);
         }
         
-        doc.clear();
-        doc["temperature"] = temperature;
-        serializeJson(doc, msg_buffer);
+        // Publish temperature state
+        snprintf(msg_buffer, sizeof(msg_buffer), "%.2f", temperature);
         client.publish(MQTT_TEMPERATURE_STATE_TOPIC, msg_buffer);
+        
+        // After getting a new temperature, re-evaluate the system state
+        update_states();
       } else {
         Serial.println("[ERROR] Invalid temperature reading from sensor.");
         client.publish(MQTT_DEBUG_TOPIC, "ERROR: Invalid temp reading");
@@ -211,7 +212,6 @@ void loop() {
     }
   }
   
-  // Handle web server and OTA updates regardless of MQTT connection
   server.handleClient();
   ElegantOTA.loop();
 }
@@ -221,9 +221,6 @@ void loop() {
 //                            NETWORK FUNCTIONS
 //================================================================================
 
-/**
- * @brief Initializes and connects to the WiFi network. Blocks until connected.
- */
 void setup_wifi() {
   WiFi.setHostname(HOSTNAME);
   WiFi.mode(WIFI_STA);
@@ -238,44 +235,38 @@ void setup_wifi() {
   Serial.println(WiFi.localIP());
 }
 
-/**
- * @brief Initializes the MQTT client and connects to the broker.
- */
 void setup_mqtt() {
   client.setServer(MQTT_BROKER, MQTT_PORT);
   client.setCallback(mqtt_callback);
 }
 
-/**
- * @brief NEW: Non-blocking function to manage WiFi and MQTT connections.
- * Attempts to reconnect periodically if a connection is lost.
- */
 void handle_connections() {
-  // --- WiFi Connection Handling ---
   if (WiFi.status() != WL_CONNECTED) {
     if (millis() - last_reconnect_attempt_time > RECONNECT_INTERVAL) {
       last_reconnect_attempt_time = millis();
       Serial.println("[WARN] WiFi disconnected. Attempting to reconnect...");
       WiFi.reconnect();
     }
-    return; // Don't try MQTT if WiFi is down
+    return;
   }
 
-  // --- MQTT Connection Handling ---
   if (!client.connected()) {
     if (millis() - last_reconnect_attempt_time > RECONNECT_INTERVAL) {
       last_reconnect_attempt_time = millis();
       Serial.println("[WARN] MQTT disconnected. Attempting to reconnect...");
       String client_id = "spa-controller-client-";
       client_id += WiFi.macAddress();
-      if (client.connect(client_id.c_str(), MQTT_USER, MQTT_PASSWORD)) {
+      if (client.connect(client_id.c_str(), MQTT_USER, MQTT_PASSWORD, MQTT_SPA_AVAILABLE, 0, true, "offline")) {
         Serial.println("[INFO] MQTT reconnected successfully!");
+        client.publish(MQTT_SPA_AVAILABLE, "online", true);
         // Resubscribe to topics upon reconnection
         client.subscribe(MQTT_SPA_SET_TOPIC);
         client.subscribe(MQTT_BLOWER_SET_TOPIC);
         client.subscribe(MQTT_FAST_HEATING_SET_TOPIC);
         client.subscribe(MQTT_STANDBY_WARMING_SET_TOPIC);
         client.subscribe(MQTT_TEMPERATURE_SET_TOPIC);
+        // FIX: Added missing semicolon and ensured subscription
+        client.subscribe(MQTT_CIRCULATION_ONLY_SET_TOPIC);
         // Publish current state to sync with HA
         update_states();
       } else {
@@ -286,27 +277,18 @@ void handle_connections() {
   }
 }
 
-/**
- * @brief Callback function for handling incoming MQTT messages.
- * @param topic The MQTT topic the message arrived on.
- * @param payload The message payload.
- * @param length The length of the payload.
- */
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("[MQTT] Message arrived on topic: ");
   Serial.println(topic);
 
-  // ERROR HANDLING: Safely copy payload to a null-terminated buffer
   char payload_buffer[length + 1];
   memcpy(payload_buffer, payload, length);
   payload_buffer[length] = '\0';
   Serial.print("[MQTT] Payload: ");
   Serial.println(payload_buffer);
 
-  // Determine the new state from the payload
   bool is_on = is_payload_on(payload, length);
 
-  // Route command based on topic
   if (strcmp(topic, MQTT_SPA_SET_TOPIC) == 0) {
     spa_state = is_on;
   } else if (strcmp(topic, MQTT_FAST_HEATING_SET_TOPIC) == 0) {
@@ -315,10 +297,14 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     standby_warming_state = is_on;
   } else if (strcmp(topic, MQTT_BLOWER_SET_TOPIC) == 0) {
     blower_state = is_on;
+  // FIX: Added the missing handler for the circulation_only state
+  } else if (strcmp(topic, MQTT_CIRCULATION_ONLY_SET_TOPIC) == 0) {
+    circulation_only_state = is_on;
   } else if (strcmp(topic, MQTT_TEMPERATURE_SET_TOPIC) == 0) {
-    // ERROR HANDLING: Ensure payload is a valid number before converting
     if (isDigit(payload_buffer[0]) || (payload_buffer[0] == '-' && isDigit(payload_buffer[1]))) {
         temperature_target = atof(payload_buffer);
+        // Also publish the new target back to the state topic to confirm
+        client.publish(MQTT_TEMPERATURE_SET_TOPIC, payload_buffer);
     } else {
         Serial.println("[WARN] Received non-numeric temperature target.");
     }
@@ -344,38 +330,30 @@ float get_temp() {
   }
   avg_adc /= NUMSAMPLES;
 
-  // ERROR HANDLING: Check if the ADC reading is within the LUT's bounds
   size_t lut_size = sizeof(ADC_LUT) / sizeof(ADC_LUT[0]);
   if (avg_adc < 0 || avg_adc >= lut_size) {
     Serial.printf("[ERROR] ADC reading %.2f is out of LUT bounds (0-%d).\n", avg_adc, lut_size - 1);
-    return NAN; // Return Not-a-Number to signal an error
+    return NAN;
   }
 
-  // Use Lookup Table for linearization
   float linearized_adc = ADC_LUT[int(avg_adc)];
   
-  // Calculate resistance using voltage divider formula
   float v_out = linearized_adc / 4095.0 * 3.3;
-  if (v_out == 0) return NAN; // Avoid division by zero
+  voltage_read = v_out;
+  if (v_out == 0) return NAN; 
   float thermistor_resistance = SERIESRESISTOR * ((3.3 / v_out) - 1.0);
 
-  // Calculate temperature using Steinhart-Hart equation
   float steinhart;
   steinhart = thermistor_resistance / THERMISTORNOMINAL;
   steinhart = log(steinhart);
   steinhart /= BCOEFFICIENT;
   steinhart += 1.0 / (TEMPERATURENOMINAL + 273.15);
   steinhart = 1.0 / steinhart;
-  steinhart -= 273.15; // Convert from Kelvin to Celsius
+  steinhart -= 273.15;
 
-  // Use a circular buffer for a moving average over the last 10 readings
-  temp_history_buffer.push(steinhart);
-  float moving_average = 0;
-  for (int i = 0; i < temp_history_buffer.size(); i++) {
-    moving_average += temp_history_buffer[i];
-  }
-  
-  return moving_average / temp_history_buffer.size();
+  // FIX: Removed the redundant moving average from the circular buffer.
+  // The EMA in loop() is sufficient and more effective.
+  return steinhart;
 }
 
 /**
@@ -388,7 +366,9 @@ void update_states() {
   client.publish(MQTT_STANDBY_WARMING_STATE_TOPIC, bool_to_on_off(standby_warming_state));
   client.publish(MQTT_FAST_HEATING_STATE_TOPIC, bool_to_on_off(fast_heating_state));
   client.publish(MQTT_BLOWER_STATE_TOPIC, bool_to_on_off(blower_state));
-  
+  // FIX: Changed topic from MQTT_CIRCULATION_ONLY_TOPIC to the correct one
+  client.publish(MQTT_CIRCULATION_ONLY_STATE_TOPIC, bool_to_on_off(circulation_only_state));
+
   // --- Control Logic ---
   if (spa_state) {
     float current_target = temperature_target;
@@ -399,25 +379,25 @@ void update_states() {
       current_tolerance = standby_tolerance;
     }
 
-    // Temperature is too high
-    if (temperature > current_target + current_tolerance) {
-      digitalWrite(INTERNAL_HEATER_PIN, LOW);
-      digitalWrite(EXTERNAL_HEATER_PIN, LOW);
-      // In standby, turn pump off when temp is high. Otherwise, keep it on for circulation.
-      digitalWrite(PUMP_PIN, standby_warming_state ? LOW : HIGH);
-    } 
-    // Temperature is too low
-    else if (temperature < current_target - current_tolerance) {
-      digitalWrite(PUMP_PIN, HIGH); // Always run pump if heating is needed
+    // Determine if heating should be enabled at all
+    // FIX: If circulation_only is true, heating is NEVER allowed.
+    bool heating_needed = (temperature < current_target - current_tolerance) && !circulation_only_state;
+
+    // Pump Logic: Pump should run if heating is needed, or if the spa is on and not in standby.
+    // In standby, the pump only runs when heating. Otherwise, it circulates continuously.
+    bool pump_on = heating_needed || !standby_warming_state || circulation_only_state;
+    digitalWrite(PUMP_PIN, pump_on ? HIGH : LOW);
+
+    // Heater Logic
+    if (heating_needed) {
+      // External heater is the primary heater
       digitalWrite(EXTERNAL_HEATER_PIN, HIGH);
-      // Internal heater only for fast heating mode
+      // Internal heater is only for fast heating mode
       digitalWrite(INTERNAL_HEATER_PIN, fast_heating_state ? HIGH : LOW);
-    } 
-    // Temperature is OK
-    else {
-      digitalWrite(PUMP_PIN, HIGH); // Keep pump running for circulation
-      digitalWrite(INTERNAL_HEATER_PIN, LOW);
+    } else {
+      // Turn off both heaters if temp is OK, too high, or in circulation_only mode
       digitalWrite(EXTERNAL_HEATER_PIN, LOW);
+      digitalWrite(INTERNAL_HEATER_PIN, LOW);
     }
 
     // Blower is independent of temperature
@@ -433,9 +413,9 @@ void update_states() {
 
   // --- Print current status to Serial Monitor for debugging ---
   Serial.println("=== Current Spa States ===");
-  Serial.printf("Spa Power: %s, Standby: %s, Fast Heat: %s, Blower: %s\n", 
+  Serial.printf("Spa Power: %s, Standby: %s, Fast Heat: %s, Blower: %s, Circ Only: %s\n", 
                 bool_to_on_off(spa_state), bool_to_on_off(standby_warming_state), 
-                bool_to_on_off(fast_heating_state), bool_to_on_off(blower_state));
+                bool_to_on_off(fast_heating_state), bool_to_on_off(blower_state), bool_to_on_off(circulation_only_state));
   Serial.printf("Temp: %.2f C, Target: %.2f C\n", temperature, temperature_target);
   Serial.println("--- GPIO Output States ---");
   Serial.printf("PUMP (%d): %s, EXT_HEATER (%d): %s, INT_HEATER (%d): %s, BLOWER (%d): %s\n",
@@ -451,22 +431,12 @@ void update_states() {
 //                               UTILITY FUNCTIONS
 //================================================================================
 
-/**
- * @brief Converts a boolean to an "ON" or "OFF" string.
- * @param state The boolean state.
- * @return A const char* to "ON" or "OFF".
- */
 const char* bool_to_on_off(bool state) {
   return state ? "ON" : "OFF";
 }
 
-/**
- * @brief Checks if an MQTT payload is "ON" (case-insensitive).
- * @param payload The message payload.
- * @param length The length of the payload.
- * @return True if the payload is "ON", false otherwise.
- */
 bool is_payload_on(const byte* payload, unsigned int length) {
+  // Make it case-insensitive
   if (length == 2 && toupper(payload[0]) == 'O' && toupper(payload[1]) == 'N') {
     return true;
   }
