@@ -1,0 +1,63 @@
+mqtt:
+  switch:
+    #================================================
+    # Zado Spa - Circulation Pump
+    #================================================
+    - unique_id: zado_spa_circulation_pump
+      name: "Zado Spa Circulation Pump"
+      
+      # --- Topics defined in the ESP32 code ---
+      state_topic: "zado_spa/circulation_pump/state"
+      command_topic: "zado_spa/circulation_pump/set"
+      availability_topic: "zado_spa/available"
+      
+      # --- Payloads ---
+      payload_on: "ON"
+      payload_off: "OFF"
+      state_on: "ON"
+      state_off: "OFF"
+      
+      # --- Settings ---
+      optimistic: false
+      qos: 0
+      retain: true # Keep the last state in the broker
+
+      # --- This 'device' block links this switch to the Zado Spa device ---
+      device:
+        identifiers:
+          - "simple-spa-controller" # This must match the other entities for this device
+        name: "Zado Spa"
+        manufacturer: "Zado Industries"
+        model: "ESP32 Two-Relay Controller"
+        sw_version: "1.0"
+
+    #================================================
+    # Zado Spa - Heater
+    #================================================
+    - unique_id: zado_spa_heater
+      name: "Zado Spa Heater"
+
+      # --- Topics defined in the ESP32 code ---
+      state_topic: "zado_spa/heater/state"
+      command_topic: "zado_spa/heater/set"
+      availability_topic: "zado_spa/available"
+
+      # --- Payloads ---
+      payload_on: "ON"
+      payload_off: "OFF"
+      state_on: "ON"
+      state_off: "OFF"
+      
+      # --- Settings ---
+      optimistic: false
+      qos: 0
+      retain: true
+
+      # --- This 'device' block links this switch to the Zado Spa device ---
+      device:
+        identifiers:
+          - "simple-spa-controller" # This identifier must be identical
+        name: "Zado Spa"
+        manufacturer: "Zado Industries"
+        model: "ESP32 Two-Relay Controller"
+        sw_version: "1.0"
