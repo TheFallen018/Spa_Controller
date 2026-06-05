@@ -31,7 +31,7 @@ const int SERIESRESISTOR = 10000;         // Value of the series resistor
 const int NUMSAMPLES = 10;                // Number of samples to average for a reading
 
 //--- WiFi & Web Server Configuration ---
-const char* WIFI_SSID = "2.4G-Tower_EXT";
+const char* WIFI_SSID = "2.4G-Tower";
 const char* WIFI_PASSWORD = "Network_Layer";
 const char* HOSTNAME = "spa-controller";
 WebServer server(80);
