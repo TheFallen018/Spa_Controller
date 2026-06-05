@@ -13,6 +13,9 @@
 #include <CircularBuffer.hpp> // NOTE: This is no longer used for logic, but kept for potential future use.
 #include <WebServer.h>
 #include <ElegantOTA.h>
+#include <EEPROM.h>
+#include <ESPmDNS.h>
+
 #include "lut.h" // Assumes lut.h contains the ADC_LUT array
 
 //--- Pin Definitions ---
@@ -22,19 +25,48 @@ const int INTERNAL_HEATER_PIN = 12;
 const int BLOWER_PIN = 14;
 const int LED_PIN = 27; // Unused in logic, but defined
 const int THERMISTOR_PIN = 35;
+const int ONBOARD_LED_PIN = 2;
+
 
 //--- Thermistor Configuration ---
-const int THERMISTORNOMINAL = 10000;      // Resistance at 25°C
+const int THERMISTORNOMINAL = 84000;      // Resistance at 25°C
 const int TEMPERATURENOMINAL = 25;        // Temperature for nominal resistance
-const int BCOEFFICIENT = 3800;            // Beta coefficient of the thermistor
+const int BCOEFFICIENT = 4193;            // Beta coefficient of the thermistor
 const int SERIESRESISTOR = 10000;         // Value of the series resistor
 const int NUMSAMPLES = 10;                // Number of samples to average for a reading
 
 //--- WiFi & Web Server Configuration ---
-const char* WIFI_SSID = "2.4G-Tower";
-const char* WIFI_PASSWORD = "Network_Layer";
+//--- Access Point (AP) Configuration for Setup ---
+const char* AP_SSID = "ESP32-Spa-Setup";
+#define EEPROM_SIZE 256
+
 const char* HOSTNAME = "spa-controller";
 WebServer server(80);
+
+// --- Factory Reset Configuration ---
+const int RESET_EEPROM_ADDR = EEPROM_SIZE - 1;
+const int RESET_CYCLE_TARGET = 5;
+const unsigned long SUCCESSFUL_BOOT_TIMEOUT_MS = 20000;
+
+// --- Global variables ---
+unsigned long boot_time = 0;
+bool reset_counter_cleared = false;
+unsigned long last_wifi_reconnect_attempt = 0;
+unsigned long last_time_debug_print = 0;
+
+struct WifiConfig {
+  char ssid[33] = "";
+  char password[65] = "";
+};
+
+struct ControllerConfig {
+  uint32_t magic_marker = 0xDEADBEEF;
+  WifiConfig wifi;
+};
+
+ControllerConfig controller_config;
+
+
 
 //--- MQTT Configuration ---
 const char* MQTT_BROKER = "192.168.0.180";
@@ -87,7 +119,7 @@ unsigned long last_reconnect_attempt_time = 0;
 const long TEMP_READ_INTERVAL = 5000;      // Read temperature every 5 seconds
 const long MQTT_PUBLISH_INTERVAL = 60000;  // Publish availability every 60 seconds
 const long RECONNECT_INTERVAL = 30000;     // Attempt reconnect every 30 seconds if disconnected
-
+bool in_config_mode = false;
 
 //================================================================================
 //                             FORWARD DECLARATIONS
@@ -100,7 +132,14 @@ float get_temp();
 void update_states();
 const char* bool_to_on_off(bool state);
 bool is_payload_on(const byte* payload, unsigned int length);
-
+void handle_config_root();
+void handle_save_wifi();
+void load_config_from_eeprom();
+void save_config_to_eeprom();
+void print_config();
+void clear_eeprom_and_restart();
+bool connect_to_wifi();
+void setup_ap_mode();
 
 //================================================================================
 //                                  SETUP
@@ -108,6 +147,21 @@ bool is_payload_on(const byte* payload, unsigned int length);
 void setup() {
   Serial.begin(115200);
   Serial.println("\n[INFO] Booting Spa Controller...");
+
+  EEPROM.begin(EEPROM_SIZE);
+
+  byte boot_counter = EEPROM.read(RESET_EEPROM_ADDR);
+  Serial.printf("[RESET] Boot counter is: %d\n", boot_counter);
+  boot_counter++;
+
+  if (boot_counter >= RESET_CYCLE_TARGET) {
+    Serial.printf("[RESET] Reached target of %d boots. Wiping EEPROM.\n", RESET_CYCLE_TARGET);
+    clear_eeprom_and_restart();
+  }
+
+  EEPROM.write(RESET_EEPROM_ADDR, boot_counter);
+  EEPROM.commit();
+  boot_time = millis();
 
   //--- Initialize GPIO Pins ---
   pinMode(PUMP_PIN, OUTPUT);
@@ -120,53 +174,62 @@ void setup() {
   digitalWrite(BLOWER_PIN, LOW);
 
   //--- Initialize Network & Services ---
-  setup_wifi();
-  setup_mqtt();
+  load_config_from_eeprom();
+
+  if (!connect_to_wifi()) {
+    in_config_mode = true;
+    setup_ap_mode();
+  } else {
+    in_config_mode = false;
   
-  //--- Initialize Web Server & OTA ---
-  ElegantOTA.begin(&server);
-  server.on("/", HTTP_GET, []() {
-    String html = "<html><head><title>ESP32 Spa Controller</title>";
-    html += "<meta http-equiv='refresh' content='5'>"; // Auto-refresh every 5 seconds
-    html += "<style>"
-            "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }"
-            "h1, h2 { color: #0056b3; }"
-            "a { color: #007bff; text-decoration: none; font-size: 1.2em; }"
-            "a:hover { text-decoration: underline; }"
-            "table { width: 60%; border-collapse: collapse; margin-top: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }"
-            "th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }"
-            "th { background-color: #007bff; color: white; }"
-            ".state-on, .state-high { color: #28a745; font-weight: bold; }"
-            ".state-off, .state-low { color: #dc3545; font-weight: bold; }"
-            "</style></head><body>";
-    html += "<h1>ESP32 Spa Controller Status</h1>";
-    html += "<p><a href='/update'>» Go to Firmware Update Page</a></p>";
-    html += "<h2>Controller States</h2><table>";
-    html += "<tr><th>Parameter</th><th>State</th></tr>";
-    html += "<tr><td>Spa Power</td><td><span class='state-" + String(spa_state ? "on" : "off") + "'>" + bool_to_on_off(spa_state) + "</span></td></tr>";
-    html += "<tr><td>Standby Warming</td><td><span class='state-" + String(standby_warming_state ? "on" : "off") + "'>" + bool_to_on_off(standby_warming_state) + "</span></td></tr>";
-    html += "<tr><td>Fast Heating</td><td><span class='state-" + String(fast_heating_state ? "on" : "off") + "'>" + bool_to_on_off(fast_heating_state) + "</span></td></tr>";
-    // FIX: Added circulation only state to the web page
-    html += "<tr><td>Circulation Only</td><td><span class='state-" + String(circulation_only_state ? "on" : "off") + "'>" + bool_to_on_off(circulation_only_state) + "</span></td></tr>";
-    html += "<tr><td>Blower</td><td><span class='state-" + String(blower_state ? "on" : "off") + "'>" + bool_to_on_off(blower_state) + "</span></td></tr>";
-    html += "</table>";
-    html += "<h2>Temperature</h2><table>";
-    html += "<tr><th>Parameter</th><th>Value</th></tr>";
-    html += "<tr><td>Current Temperature</td><td>" + String(temperature, 2) + "°C</td></tr>";
-    html += "<tr><td>Voltage Read</td><td>" + String(voltage_read, 2) + "</td></tr>";
-    html += "<tr><td>Target Temperature</td><td>" + String(temperature_target, 2) + "°C</td></tr>";
-    html += "</table>";
-    html += "<h2>GPIO Output States</h2><table>";
-    html += "<tr><th>Device</th><th>GPIO Pin</th><th>State</th></tr>";
-    html += "<tr><td>PUMP</td><td>" + String(PUMP_PIN) + "</td><td><span class='state-" + String(digitalRead(PUMP_PIN) ? "high" : "low") + "'>" + String(digitalRead(PUMP_PIN) ? "HIGH" : "LOW") + "</span></td></tr>";
-    html += "<tr><td>EXTERNAL_HEATER</td><td>" + String(EXTERNAL_HEATER_PIN) + "</td><td><span class='state-" + String(digitalRead(EXTERNAL_HEATER_PIN) ? "high" : "low") + "'>" + String(digitalRead(EXTERNAL_HEATER_PIN) ? "HIGH" : "LOW") + "</span></td></tr>";
-    html += "<tr><td>INTERNAL_HEATER</td><td>" + String(INTERNAL_HEATER_PIN) + "</td><td><span class='state-" + String(digitalRead(INTERNAL_HEATER_PIN) ? "high" : "low") + "'>" + String(digitalRead(INTERNAL_HEATER_PIN) ? "HIGH" : "LOW") + "</span></td></tr>";
-    html += "<tr><td>BLOWER</td><td>" + String(BLOWER_PIN) + "</td><td><span class='state-" + String(digitalRead(BLOWER_PIN) ? "high" : "low") + "'>" + String(digitalRead(BLOWER_PIN) ? "HIGH" : "LOW") + "</span></td></tr>";
-    html += "</table></body></html>";
-    server.send(200, "text/html", html);
-  });
-  server.begin();
-  Serial.println("[INFO] HTTP server started.");
+
+    setup_mqtt();
+    
+    //--- Initialize Web Server & OTA ---
+    ElegantOTA.begin(&server);
+    server.on("/", HTTP_GET, []() {
+      String html = "<html><head><title>ESP32 Spa Controller</title>";
+      html += "<meta http-equiv='refresh' content='5'>"; // Auto-refresh every 5 seconds
+      html += "<style>"
+              "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }"
+              "h1, h2 { color: #0056b3; }"
+              "a { color: #007bff; text-decoration: none; font-size: 1.2em; }"
+              "a:hover { text-decoration: underline; }"
+              "table { width: 60%; border-collapse: collapse; margin-top: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }"
+              "th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }"
+              "th { background-color: #007bff; color: white; }"
+              ".state-on, .state-high { color: #28a745; font-weight: bold; }"
+              ".state-off, .state-low { color: #dc3545; font-weight: bold; }"
+              "</style></head><body>";
+      html += "<h1>ESP32 Spa Controller Status</h1>";
+      html += "<p><a href='/update'>» Go to Firmware Update Page</a></p>";
+      html += "<h2>Controller States</h2><table>";
+      html += "<tr><th>Parameter</th><th>State</th></tr>";
+      html += "<tr><td>Spa Power</td><td><span class='state-" + String(spa_state ? "on" : "off") + "'>" + bool_to_on_off(spa_state) + "</span></td></tr>";
+      html += "<tr><td>Standby Warming</td><td><span class='state-" + String(standby_warming_state ? "on" : "off") + "'>" + bool_to_on_off(standby_warming_state) + "</span></td></tr>";
+      html += "<tr><td>Fast Heating</td><td><span class='state-" + String(fast_heating_state ? "on" : "off") + "'>" + bool_to_on_off(fast_heating_state) + "</span></td></tr>";
+      // FIX: Added circulation only state to the web page
+      html += "<tr><td>Circulation Only</td><td><span class='state-" + String(circulation_only_state ? "on" : "off") + "'>" + bool_to_on_off(circulation_only_state) + "</span></td></tr>";
+      html += "<tr><td>Blower</td><td><span class='state-" + String(blower_state ? "on" : "off") + "'>" + bool_to_on_off(blower_state) + "</span></td></tr>";
+      html += "</table>";
+      html += "<h2>Temperature</h2><table>";
+      html += "<tr><th>Parameter</th><th>Value</th></tr>";
+      html += "<tr><td>Current Temperature</td><td>" + String(temperature, 2) + "°C</td></tr>";
+      html += "<tr><td>Voltage Read</td><td>" + String(voltage_read, 2) + "</td></tr>";
+      html += "<tr><td>Target Temperature</td><td>" + String(temperature_target, 2) + "°C</td></tr>";
+      html += "</table>";
+      html += "<h2>GPIO Output States</h2><table>";
+      html += "<tr><th>Device</th><th>GPIO Pin</th><th>State</th></tr>";
+      html += "<tr><td>PUMP</td><td>" + String(PUMP_PIN) + "</td><td><span class='state-" + String(digitalRead(PUMP_PIN) ? "high" : "low") + "'>" + String(digitalRead(PUMP_PIN) ? "HIGH" : "LOW") + "</span></td></tr>";
+      html += "<tr><td>EXTERNAL_HEATER</td><td>" + String(EXTERNAL_HEATER_PIN) + "</td><td><span class='state-" + String(digitalRead(EXTERNAL_HEATER_PIN) ? "high" : "low") + "'>" + String(digitalRead(EXTERNAL_HEATER_PIN) ? "HIGH" : "LOW") + "</span></td></tr>";
+      html += "<tr><td>INTERNAL_HEATER</td><td>" + String(INTERNAL_HEATER_PIN) + "</td><td><span class='state-" + String(digitalRead(INTERNAL_HEATER_PIN) ? "high" : "low") + "'>" + String(digitalRead(INTERNAL_HEATER_PIN) ? "HIGH" : "LOW") + "</span></td></tr>";
+      html += "<tr><td>BLOWER</td><td>" + String(BLOWER_PIN) + "</td><td><span class='state-" + String(digitalRead(BLOWER_PIN) ? "high" : "low") + "'>" + String(digitalRead(BLOWER_PIN) ? "HIGH" : "LOW") + "</span></td></tr>";
+      html += "</table></body></html>";
+      server.send(200, "text/html", html);
+    });
+    server.begin();
+    Serial.println("[INFO] HTTP server started.");
+  }
 }
 
 
@@ -221,18 +284,61 @@ void loop() {
 //                            NETWORK FUNCTIONS
 //================================================================================
 
-void setup_wifi() {
+bool connect_to_wifi() {
+  if (String(controller_config.wifi.ssid).length() == 0) return false;
+
   WiFi.setHostname(HOSTNAME);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("[INFO] Connecting to WiFi...");
-  while (WiFi.status() != WL_CONNECTED) {
+  WiFi.begin(controller_config.wifi.ssid, controller_config.wifi.password);
+  Serial.print("[INFO] Connecting to WiFi: ");
+  Serial.print(controller_config.wifi.ssid);
+  
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
     delay(500);
     Serial.print(".");
+    retries++;
   }
-  Serial.println("\n[INFO] WiFi connected!");
-  Serial.print("[INFO] IP Address: ");
-  Serial.println(WiFi.localIP());
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[INFO] WiFi connected!");
+    Serial.print("[INFO] IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    if (MDNS.begin(HOSTNAME)) {
+      Serial.printf("[mDNS] Responder started. Access at http://%s.local\n", HOSTNAME);
+      MDNS.addService("http", "tcp", 80);
+    } else {
+      Serial.println("[mDNS] Error setting up MDNS responder!");
+    }
+    return true;
+  } else {
+    Serial.println("\n[ERROR] WiFi connection failed.");
+    return false;
+  }
+}
+
+void handle_config_root() {
+    String html = R"rawliteral(
+<!DOCTYPE HTML><html><head>
+<title>ESP32 WiFi Setup</title><meta name="viewport" content="width=device-width, initial-scale=1">
+<style> body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; text-align: center; } h1 { color: #0056b3; } .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); display: inline-block; } input[type=text], input[type=password] { width: 90%; padding: 12px; margin: 8px 0; display: inline-block; border: 1px solid #ccc; border-radius: 4px; } input[type=submit] { background-color: #007bff; color: white; padding: 14px 20px; margin: 8px 0; border: none; border-radius: 4px; cursor: pointer; width: 95%; } input[type=submit]:hover { background-color: #0056b3; } </style>
+</head><body><div class="container"><h1>Spa Controller WiFi Setup</h1><p>Connect the ESP32 to your local WiFi network.</p>
+<form action="/savewifi" method="post"><label for="ssid">WiFi Network Name (SSID)</label><input type="text" id="ssid" name="ssid" placeholder="Your network name"><label for="pass">Password</label><input type="password" id="pass" name="password" placeholder="Your network password"><input type="submit" value="Save and Restart"></form>
+</div></body></html>)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void setup_ap_mode() {
+  Serial.println("[INFO] Starting Access Point mode for configuration.");
+  WiFi.softAP(AP_SSID);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("[INFO] AP IP address: ");
+  Serial.println(ip);
+  server.on("/", HTTP_GET, handle_config_root);
+  server.on("/savewifi", HTTP_POST, handle_save_wifi);
+  server.begin();
+  Serial.println("[INFO] HTTP server started for configuration.");
 }
 
 void setup_mqtt() {
@@ -241,6 +347,9 @@ void setup_mqtt() {
 }
 
 void handle_connections() {
+  if (in_config_mode) {
+    return; 
+  }
   if (WiFi.status() != WL_CONNECTED) {
     if (millis() - last_reconnect_attempt_time > RECONNECT_INTERVAL) {
       last_reconnect_attempt_time = millis();
@@ -275,6 +384,73 @@ void handle_connections() {
       }
     }
   }
+}
+
+void load_config_from_eeprom() {
+  EEPROM.get(0, controller_config);
+  Serial.println("[DEBUG] Just loaded the following from EEPROM:");
+  print_config();
+  if (controller_config.magic_marker != 0xDEADBEEF) {
+    Serial.println("[WARN] EEPROM not initialized. Loading defaults.");
+    controller_config.magic_marker = 0xDEADBEEF;
+    strcpy(controller_config.wifi.ssid, "");
+    strcpy(controller_config.wifi.password, "");
+
+    save_config_to_eeprom();
+  } else {
+    Serial.println("[INFO] Successfully loaded configuration from EEPROM.");
+  }
+}
+
+void save_config_to_eeprom() {
+  EEPROM.put(0, controller_config);
+  if (EEPROM.commit()) {
+    Serial.println("[INFO] Configuration saved to EEPROM successfully.");
+    Serial.println("[DEBUG] Just saved the following to EEPROM:");
+    print_config();
+  } else {
+    Serial.println("[ERROR] Failed to save configuration to EEPROM.");
+  }
+}
+
+void print_config() {
+  Serial.println("--- DUMPING CURRENT CONFIGURATION ---");
+  Serial.printf("Magic Marker: 0x%X\n", controller_config.magic_marker);
+  Serial.printf("WiFi SSID: '%s'\n", controller_config.wifi.ssid);
+
+  Serial.println("------------------------------------");
+}
+
+void clear_eeprom_and_restart() {
+  Serial.println("[RESET] Factory reset triggered!");
+  for (int i = 0; i < 10; i++) {
+    digitalWrite(ONBOARD_LED_PIN, HIGH);
+    delay(50);
+    digitalWrite(ONBOARD_LED_PIN, LOW);
+    delay(50);
+  }
+  Serial.println("[RESET] Clearing EEPROM...");
+  for (int i = 0; i < EEPROM_SIZE; i++) { 
+    EEPROM.write(i, 0);
+  }
+  EEPROM.commit();
+  Serial.println("[RESET] EEPROM cleared. Restarting device.");
+  delay(1000);
+  ESP.restart();
+}
+
+void handle_save_wifi() {
+  String ssid = server.arg("ssid");
+  String password = server.arg("password");
+  strncpy(controller_config.wifi.ssid, ssid.c_str(), sizeof(controller_config.wifi.ssid));
+  controller_config.wifi.ssid[sizeof(controller_config.wifi.ssid) - 1] = '\0';
+  strncpy(controller_config.wifi.password, password.c_str(), sizeof(controller_config.wifi.password));
+  controller_config.wifi.password[sizeof(controller_config.wifi.password) - 1] = '\0';
+  save_config_to_eeprom();
+  String html = "<html><body><h1>Credentials Saved!</h1><p>The device will now restart.</p></body></html>";
+  server.send(200, "text/html", html);
+  delay(2000);
+  ESP.restart();
 }
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
@@ -339,7 +515,9 @@ float get_temp() {
   float linearized_adc = ADC_LUT[int(avg_adc)];
   
   float v_out = linearized_adc / 4095.0 * 3.3;
-  voltage_read = v_out;
+  // voltage_read = v_out;
+  // Serial.println("Voltage read: ");
+  Serial.print(v_out);
   if (v_out == 0) return NAN; 
   float thermistor_resistance = SERIESRESISTOR * ((3.3 / v_out) - 1.0);
 
@@ -353,6 +531,7 @@ float get_temp() {
 
   // FIX: Removed the redundant moving average from the circular buffer.
   // The EMA in loop() is sufficient and more effective.
+
   return steinhart;
 }
 
@@ -436,9 +615,13 @@ const char* bool_to_on_off(bool state) {
 }
 
 bool is_payload_on(const byte* payload, unsigned int length) {
-  // Make it case-insensitive
-  if (length == 2 && toupper(payload[0]) == 'O' && toupper(payload[1]) == 'N') {
-    return true;
-  }
+  char temp[length + 1];
+  memcpy(temp, payload, length);
+  temp[length] = '\0'; // Null terminate
+  
+  if (strcasecmp(temp, "ON") == 0) return true;
+  if (strcasecmp(temp, "TRUE") == 0) return true;
+  if (strncmp(temp, "1", 1) == 0) return true;
+  
   return false;
 }
